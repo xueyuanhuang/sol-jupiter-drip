@@ -1,0 +1,20 @@
+# env & secrets
+.env
+
+# logs
+logs/
+*.log
+
+# runtime data
+data/
+state.json
+
+# node
+node_modules/
+
+# OS
+.DS_Store
+
+# editor
+.vscode/
+

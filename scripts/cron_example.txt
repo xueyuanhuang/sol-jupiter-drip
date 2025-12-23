@@ -1,0 +1,18 @@
+# Cron Configuration Example
+# Goal: Run DRIP daily at 21:00 (UTC+8 / Asia/Shanghai)
+
+# 1. Check server timezone
+# timedatectl
+# If not Asia/Shanghai, either set system timezone or handle offset in cron.
+# Recommended: Set system timezone
+# sudo timedatectl set-timezone Asia/Shanghai
+
+# 2. Add to crontab
+# Run: crontab -e
+# Add the following line (adjust path to your actual location):
+
+0 21 * * * /home/ubuntu/Sol-jupiter-drip/scripts/run_daily_drip.sh
+
+# 3. Verification
+# Check logs after 21:00:
+# tail -f /home/ubuntu/Sol-jupiter-drip/logs/drip_*.log
