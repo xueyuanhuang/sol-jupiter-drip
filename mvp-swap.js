@@ -107,10 +107,11 @@ function ensureDir(dir) {
   if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
 }
 
-function saveDripState(data) {
+function saveDripState(data, label = null) {
   try {
     ensureDir('data');
-    const file = path.join('data', 'state.json');
+    const filename = label ? `state_${label}.json` : 'state.json';
+    const file = path.join('data', filename);
     const content = {
       updatedAt: new Date().toISOString(),
       ...data
@@ -734,7 +735,7 @@ function buildDripSummaryText(s) {
   return text;
 }
 
-async function runDripMode(connection, keypair) {
+async function runDripMode(connection, keypair, { walletLabel = null } = {}) {
   // 1. Config
   const TOTAL_TRADES = parseInt(process.env.DRIP_TRADES || '150', 10);
   const WINDOW_SEC = parseInt(process.env.DRIP_WINDOW_SEC || '3600', 10);
@@ -748,6 +749,7 @@ async function runDripMode(connection, keypair) {
   const IS_DRY_RUN = process.env.DRIP_DRY_RUN === 'true';
 
   console.log(`[DRIP] Mode STARTED`);
+  if (walletLabel) console.log(`[DRIP] Wallet Label: ${walletLabel}`);
   console.log(`[DRIP] Config: ${TOTAL_TRADES} trades in ${WINDOW_SEC}s`);
   console.log(`[DRIP] Amount: ${USDC_MIN}-${USDC_MAX} USDC`);
   console.log(`[DRIP] Start: ${START_DIR}`);
@@ -899,7 +901,7 @@ async function runDripMode(connection, keypair) {
           exitReason,
           exitError,
           stats
-        });
+        }, walletLabel);
 
         const msg = buildDripSummaryText(summaryObj);
 
@@ -1106,11 +1108,71 @@ async function runDripMode(connection, keypair) {
   }
 }
 
+async function runMultiDrip(connection) {
+  const wallets = [];
+  
+  // 1. Load from Env (WALLET_1_MNEMONIC, WALLET_2_MNEMONIC, ...)
+  let i = 1;
+  while (process.env[`WALLET_${i}_MNEMONIC`]) {
+    wallets.push({
+      id: `w${i}`,
+      mnemonic: process.env[`WALLET_${i}_MNEMONIC`]
+    });
+    i++;
+  }
+
+  // 2. Load from JSON (optional)
+  const jsonPath = 'wallets.json';
+  if (fs.existsSync(jsonPath)) {
+    try {
+      const json = JSON.parse(fs.readFileSync(jsonPath, 'utf8'));
+      // Support array of strings or objects
+      if (Array.isArray(json)) {
+        json.forEach((item, idx) => {
+          if (typeof item === 'string') {
+            wallets.push({ id: `json_${idx + 1}`, mnemonic: item });
+          } else if (item && item.mnemonic) {
+            wallets.push({ id: item.id || `json_${idx + 1}`, mnemonic: item.mnemonic });
+          }
+        });
+      }
+    } catch (err) {
+      console.error(`[MULTI] Failed to load ${jsonPath}: ${err.message}`);
+    }
+  }
+
+  if (wallets.length === 0) {
+    console.error('[MULTI] No wallets found. Set WALLET_1_MNEMONIC in .env or create wallets.json');
+    process.exit(1);
+  }
+
+  console.log(`[MULTI] Starting orchestrator for ${wallets.length} wallets...`);
+  
+  // Launch in parallel with staggered start to reduce RPC spike
+  const promises = wallets.map(async (w, idx) => {
+    // Stagger start by 2 seconds per wallet
+    await sleep(idx * 2000);
+    try {
+      console.log(`[MULTI] Initializing wallet ${w.id}...`);
+      assertMnemonic(w.mnemonic);
+      const kp = deriveKeypairFromMnemonic(w.mnemonic);
+      await runDripMode(connection, kp, { walletLabel: w.id });
+    } catch (err) {
+      console.error(`[MULTI] Wallet ${w.id} failed to start: ${err.message}`);
+    }
+  });
+
+  await Promise.all(promises);
+  console.log('[MULTI] All wallets finished.');
+}
+
 async function main() {
   console.log(`[INIT] Node version: ${process.version}`);
   
+  const modeArg = (process.argv[2] || 'SOL_TO_USDC');
+
   // Strict Config Validation
-  if (!MNEMONIC) {
+  if (modeArg !== 'multi-drip' && !MNEMONIC) {
     console.error('[FATAL] Missing MNEMONIC or SOLANA_MNEMONIC in .env');
     process.exit(1);
   }
@@ -1128,14 +1190,18 @@ async function main() {
   initNetwork();
   await runSelfCheck();
 
-  const modeArg = (process.argv[2] || 'SOL_TO_USDC');
-
-  assertMnemonic(MNEMONIC);
-  const keypair = deriveKeypairFromMnemonic(MNEMONIC);
+  let keypair;
+  if (modeArg !== 'multi-drip') {
+      assertMnemonic(MNEMONIC);
+      keypair = deriveKeypairFromMnemonic(MNEMONIC);
+  }
+  
   const connection = new Connection(RPC_URL, 'confirmed');
 
   if (modeArg.toLowerCase() === 'drip') {
       await runDripMode(connection, keypair);
+  } else if (modeArg === 'multi-drip') {
+      await runMultiDrip(connection);
   } else if (modeArg === 'tg-test') {
       console.log(`[TG] Testing Telegram notification...`);
       const testMsg = `*TG test ok*\nTime: ${new Date().toLocaleString()}`;

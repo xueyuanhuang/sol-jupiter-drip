@@ -1,10 +1,48 @@
 # Sol Jupiter DRIP
 
+## 0. Quick Start (For first-time users)
+Follow these steps to get running in 10 minutes:
+
+1. **Check Node.js Version**
+   Open your terminal and type:
+   ```bash
+   node -v
+   ```
+   If it's not installed or not `v20.x`, install it using nvm:
+   ```bash
+   nvm install 20
+   nvm use 20
+   ```
+
+2. **Install Dependencies**
+   Run this command in the project folder:
+   ```bash
+   npm install
+   ```
+
+3. **Configure Secrets**
+   Copy the template config file:
+   ```bash
+   cp .env.example .env
+   ```
+   Open `.env` with any text editor and fill in your:
+   - `MNEMONIC`: Your 24-word seed phrase (keep this safe!)
+   - `JUP_API_KEY`: Get one from [jup.ag](https://jup.ag)
+
+4. **Run DRIP**
+   Start the bot:
+   ```bash
+   npm run start -- drip
+   ```
+
+---
+
 ## A. What this does
 - Runs scheduled swaps for 1 hour with up to 150 trades, alternating `SOL↔USDC`, each trade targeting 2–3 USDC equivalent.
 
 ## B. Prerequisites
-- Node.js `>=18`
+- Node.js `>=20` (LTS recommended)
+  - *Tested on Node.js v20.x. Older or experimental versions (v18/v22/v23) may hang on macOS.*
 - `npm` or `pnpm` (choose one)
 - A reachable Solana RPC endpoint, e.g. `https://api.mainnet-beta.solana.com`
 - A valid Jupiter `x-api-key`
@@ -12,6 +50,7 @@
 ## C. Setup
 - Copy the example env and fill in your values:
   - `cp .env.example .env`
+  - *.env is a local configuration file for your secrets. Never commit this file to Git!*
 - Edit `.env`:
   - Provide your 24-word mnemonic (`SOLANA_MNEMONIC` or `MNEMONIC`)
   - Provide your `JUP_API_KEY`
@@ -27,6 +66,7 @@
   - `tg-test` — send a test notification to Telegram
 - DRIP mode:
   - `drip` — scheduled small swaps over a time window with alternating directions
+  - `multi-drip` — runs DRIP strategy for multiple wallets in parallel (see Section L)
   - `DRIP_DRY_RUN=true` — dry-run only quotes, does not send transactions
 - Log levels:
   - `LOG_LEVEL=info` — concise output (default)
@@ -39,6 +79,8 @@
   - `npm run start -- USDC_TO_SOL`
 - DRIP default 150 trades / 1 hour:
   - `npm run start -- drip`
+- Multi-wallet DRIP:
+  - `npm run start -- multi-drip`
 - DRIP 10 trades / 5 minutes (test):
   - `DRIP_TRADES=10 DRIP_WINDOW_SEC=300 npm run start -- drip`
 - Dry-run only (no transaction sending):
@@ -85,6 +127,11 @@ Result: SOL -> USDC (SOL delta includes fees)
 - Use `DRIP_DRY_RUN=true` for fast scheduling validation without sending transactions.
 
 ## H. Troubleshooting
+- **New User Checklist (Program hangs or no output):**
+  1. Check Node version: `node -v` (must be v20.x).
+  2. Check dependencies: Did you run `npm install`?
+  3. Check config: Does `.env` exist and have content?
+
 - 401 Unauthorized (Jupiter):
   - Ensure `JUP_API_KEY` is set and correct; verify case and no trailing spaces.
 - DNS resolution issues:
@@ -99,8 +146,15 @@ Result: SOL -> USDC (SOL delta includes fees)
   - Increase `SLIPPAGE_BPS` if quotes fail under volatile conditions (current default is 50 bps).
 - Confirmation timeout:
   - Network congestion can delay confirmations. The code polls via `getSignatureStatuses`. Retry, increase timeout, or reduce load.
+- Multi-wallet RPC Rate Limits:
+  - Running `multi-drip` with many wallets increases RPC usage significantly. If you see `429 Too Many Requests`, reduce concurrency or upgrade to a paid RPC provider.
 - Proxy misconfiguration:
   - If using `PROXY_URL`, ensure it is reachable and correct protocol (e.g., `http://127.0.0.1:7890`). You can disable proxy by removing the variable.
+- Local macOS (Node.js) Hangs:
+  - If execution hangs immediately at `require("@solana/web3.js")` (no logs), it's a known compatibility issue with older Node versions on macOS.
+  - **Solution**:
+    1. Switch to Node.js v20 LTS.
+    2. Clean reinstall dependencies: `rm -rf node_modules package-lock.json && npm install`.
 
 ## I. Telegram Notifications
 To receive a summary after each DRIP run (or interruption), configure the following in `.env`:
@@ -163,6 +217,36 @@ To run automatically every day at 21:00 (UTC+8):
    - **Logs**: stored in `logs/drip_YYYY-MM-DD_...log`
    - **State**: `data/state.json` tracks last run stats
    - **Summary Log**: `logs/summary_YYYY-MM-DD.log` contains daily summaries
+
+## L. Multi-wallet configuration
+*Note: Most users only need the single-wallet mode (`npm run start -- drip`) using `MNEMONIC`. Only use this section if you explicitly need to run multiple wallets concurrently.*
+
+To run DRIP on multiple wallets simultaneously in the same process:
+
+1. **Configure Wallets (.env)**
+   Add numbered variables for each additional wallet:
+   ```env
+   # Default wallet (required for single mode)
+   MNEMONIC=...
+
+   # Additional wallets for multi-drip mode
+   WALLET_1_MNEMONIC=...
+   WALLET_2_MNEMONIC=...
+   # ...
+   ```
+
+2. **Run Command**
+   ```bash
+   npm run start -- multi-drip
+   ```
+
+3. **State Isolation**
+   Each wallet maintains its own state file in `data/`:
+   - `data/state_w1.json` (for WALLET_1)
+   - `data/state_w2.json` (for WALLET_2)
+   - `data/state.json` (for the default single run, if used separately)
+
+   This ensures that failures or restarts in one wallet do not corrupt the state of others.
 
 ---
 
