@@ -21,7 +21,7 @@ const TG_TIMEOUT_MS = parseInt(process.env.TG_TIMEOUT_MS || '10000', 10);
 const TG_MAX_RETRY = parseInt(process.env.TG_MAX_RETRY || '3', 10);
 const TG_SINGLE_SWAP = process.env.TG_SINGLE_SWAP === 'true';
 
-const RPC_URL = process.env.RPC_URL || 'https://api.mainnet-beta.solana.com';
+const RPC_URL = process.env.SOLANA_RPC_URL || process.env.RPC_URL || 'https://api.mainnet-beta.solana.com';
 // Env precedence: prefer SOLANA_MNEMONIC; fallback to MNEMONIC for compatibility
 const MNEMONIC = process.env.SOLANA_MNEMONIC || process.env.MNEMONIC || '';
 const JUP_API_KEY = process.env.JUP_API_KEY || '';
@@ -37,7 +37,7 @@ const AMOUNT_USDC_TO_SOL_USDC = 2;
 let IS_PROXY_ENABLED = false;
 
 // Logging strategy: info prints concise operational lines; debug prints full HTTP REQ/RES and quote JSON
-const IS_DEBUG = (process.env.LOG_LEVEL || 'info').toLowerCase() === 'debug';
+const IS_DEBUG = process.env.DEBUG === 'true' || (process.env.LOG_LEVEL || 'info').toLowerCase() === 'debug';
 
 function logDebug(msg) {
   if (IS_DEBUG) console.log(msg);
@@ -529,6 +529,53 @@ function clamp(val, min, max) {
   return Math.max(min, Math.min(max, val));
 }
 
+async function getJupPrice(mint) {
+  if (mint === USDC_MINT) return 1.0;
+  
+  const url = `https://api.jup.ag/price/v3?ids=${mint}`;
+  
+  const headers = {};
+  if (JUP_API_KEY) {
+    headers['x-api-key'] = JUP_API_KEY;
+  }
+
+  try {
+    const json = await fetchJson(url, { headers }, { label: 'PRICE' });
+    if (json && json[mint]) {
+        return parseFloat(json[mint].usdPrice);
+    }
+    return 0;
+  } catch (err) {
+    if (err.status === 401) {
+        console.error(`[PRICE] Authentication failed (401). Check your JUP_API_KEY.`);
+    } else {
+        console.log(`[PRICE] Fetch failed: ${err.message}. Using USDC fallback.`);
+    }
+    // Debug log for details
+    logDebug(`[PRICE] Full error: ${err.message}`);
+    return 0;
+  }
+}
+
+async function getTokenBalanceGeneric(connection, owner, mint, decimals) {
+    if (mint === SOL_MINT) {
+        const lamports = await connection.getBalance(owner, 'confirmed');
+        return { amount: BigInt(lamports), decimals: 9 };
+    }
+    try {
+        const resp = await connection.getTokenAccountsByOwner(owner, { mint: new PublicKey(mint) }, 'confirmed');
+        if (!resp.value || resp.value.length === 0) {
+            return { amount: 0n, decimals };
+        }
+        const ata = resp.value[0].pubkey;
+        const bal = await connection.getTokenAccountBalance(ata, 'confirmed');
+        return { amount: BigInt(bal.value.amount), decimals: bal.value.decimals };
+    } catch (err) {
+        // Return null to indicate read failure (e.g. 429)
+        return null;
+    }
+}
+
 // --- Modes ---
 
 async function runSingleSwap(connection, keypair, direction) {
@@ -735,7 +782,695 @@ function buildDripSummaryText(s) {
   return text;
 }
 
+function buildAnchorSummaryTelegram(s) {
+  const walletAbbr = `${s.walletAddress.slice(0, 4)}...${s.walletAddress.slice(-4)}`;
+  const date = new Date();
+  const timeStr = date.toLocaleString('zh-CN', { hour12: false });
+  const timeZone = Intl.DateTimeFormat().resolvedOptions().timeZone;
+
+  let lines = [];
+  lines.push(`🧭 *Anchor 执行结果*`);
+  lines.push(``);
+  
+  if (s.walletLabel) {
+      lines.push(`👛 钱包：${s.walletLabel}`);
+  }
+  lines.push(`🔑 地址：\`${walletAbbr}\``);
+  lines.push(``);
+  
+  lines.push(`🔁 *执行情况*`);
+  lines.push(`计划轮次：${s.plannedCycles}`);
+  lines.push(`成功 / 失败：${s.success} ✅ / ${s.failed} ❌`);
+  lines.push(``);
+  
+  const activeTokens = Object.entries(s.roundtripCounts)
+      .filter(([_, count]) => count > 0)
+      .map(([mint, count]) => `  ${getSymbol(mint)}: ${count}`);
+  
+  if (activeTokens.length > 0) {
+      lines.push(`📊 *Roundtrip 统计*`);
+      lines.push(...activeTokens);
+      lines.push(``);
+  }
+
+  lines.push(`💰 *资产变化*`);
+  lines.push(`初始：`);
+  lines.push(`  SOL  ${s.initialBalances.sol}`);
+  lines.push(`  USDC ${s.initialBalances.usdc}`);
+  lines.push(``);
+  
+  lines.push(`结束：`);
+  lines.push(`  SOL  ${s.finalBalances.sol}`);
+  lines.push(`  USDC ${s.finalBalances.usdc}`);
+  lines.push(``);
+  
+  const netVal = s.netUSDC.replace(' USDC', '');
+  lines.push(`📈 净 USDC：${netVal}`);
+  lines.push(``);
+  
+  const elapsedSec = (s.elapsedMs / 1000).toFixed(1);
+  lines.push(`⏱ 用时：${elapsedSec} 秒`);
+  lines.push(`🕒 时间：${timeStr} (${timeZone})`);
+
+  return lines.join('\n');
+}
+
+function buildAnchorSummaryFull(s) {
+    let lines = [];
+    lines.push('================ ANCHOR SUMMARY ================');
+    if (s.walletLabel) lines.push(`Wallet Label: ${s.walletLabel}`);
+    lines.push(`Wallet: ${s.walletAddress.slice(0, 4)}...${s.walletAddress.slice(-4)}`);
+    
+    lines.push(`\nConfig: planned=${s.plannedCycles} cycles | attempted=${s.attemptedCycles} | success=${s.success} | failed=${s.failed}`);
+    
+    const countsStr = Object.entries(s.roundtripCounts)
+       .map(([mint, count]) => `${getSymbol(mint)}=${count}`)
+       .join(' | ');
+    lines.push(`Roundtrip Counts: ${countsStr}`);
+    
+    lines.push(`\nInitial Balances: SOL=${s.initialBalances.sol} | USDC=${s.initialBalances.usdc}`);
+    lines.push(`Final Balances:   SOL=${s.finalBalances.sol} | USDC=${s.finalBalances.usdc}`);
+    
+    lines.push(`Net USDC (est):   ${s.netUSDC}`);
+    
+    lines.push(`\nElapsed: ${s.elapsedMs}ms`);
+    
+    // Append Time (User requested full format to match console, but also wants time in TG)
+    // To ensure consistency, we add it here, and it will appear in console too.
+    const date = new Date();
+    const timeStr = date.toLocaleString('zh-CN', { hour12: false });
+    const timeZone = Intl.DateTimeFormat().resolvedOptions().timeZone;
+    lines.push(`Time: ${timeStr} (${timeZone})`);
+    
+    lines.push('================================================');
+    
+    return lines.join('\n');
+}
+
+function printAnchorSummaryConsole(s) {
+    console.log('\n' + buildAnchorSummaryFull(s));
+}
+
+// --- Tri-Token Mode ---
+
+function getSymbol(mint) {
+  if (mint === SOL_MINT) return 'SOL';
+  if (mint === USDC_MINT) return 'USDC';
+  return mint.slice(0, 4);
+}
+
+async function runTriTokenMode(connection, keypair, { walletLabel = null } = {}) {
+  // 1. Config
+  const TOTAL_TRADES = parseInt(process.env.DRIP_TRADES || '150', 10);
+  const WINDOW_SEC = parseInt(process.env.DRIP_WINDOW_SEC || '3600', 10);
+  const USDC_MIN = parseFloat(process.env.DRIP_USDC_MIN || '1');
+  const USDC_MAX = parseFloat(process.env.DRIP_USDC_MAX || '2');
+  const JITTER_PCT = parseFloat(process.env.DRIP_JITTER_PCT || '0.35');
+  const MIN_DELAY = parseInt(process.env.DRIP_MIN_DELAY_SEC || '5', 10);
+  const FAIL_BACKOFF = parseInt(process.env.DRIP_FAIL_BACKOFF_SEC || '20', 10) * 1000;
+  const IS_DRY_RUN = process.env.DRIP_DRY_RUN === 'true';
+  const SOL_FEE_BUFFER = 10000000n; // 0.01 SOL
+
+  // Parse tokens
+  let tokens = [];
+  try {
+    tokens = JSON.parse(process.env.DRIP_TOKENS_JSON || '[]');
+  } catch (e) {
+    throw new Error('Invalid DRIP_TOKENS_JSON format');
+  }
+  if (!Array.isArray(tokens) || tokens.length < 3) {
+     // User said "three token pool", implies at least 3.
+     // But code logic works with 2+. Let's enforce 3 as requested.
+     throw new Error('DRIP_TOKENS_JSON must contain at least 3 tokens (mint + decimals)');
+  }
+
+  console.log(`[TRI-TOKEN] Mode STARTED`);
+  if (walletLabel) console.log(`[TRI-TOKEN] Wallet Label: ${walletLabel}`);
+  console.log(`[TRI-TOKEN] Config: ${TOTAL_TRADES} trades in ${WINDOW_SEC}s`);
+  console.log(`[TRI-TOKEN] Amount: ${USDC_MIN}-${USDC_MAX} USDC`);
+  console.log(`[TRI-TOKEN] Pool: ${tokens.length} tokens`);
+  if (IS_DRY_RUN) console.log(`[TRI-TOKEN] DRY RUN ENABLED`);
+
+  const baseInterval = WINDOW_SEC / TOTAL_TRADES;
+  const publicKey = keypair.publicKey;
+
+  const stats = { success: 0, skipped: 0, failed: 0, total: 0 };
+  const tradeCounts = {}; // "MINT_A->MINT_B": count
+  const netChanges = {}; // mint: bigint
+  tokens.forEach(t => netChanges[t.mint] = 0n);
+
+  const startTime = Date.now();
+  let isExiting = false;
+  let exitReason = 'SUCCESS';
+  let exitError = '';
+
+  process.once('SIGINT', async () => {
+      console.log('\n[TRI-TOKEN] Caught interrupt signal (SIGINT). Stopping...');
+      isExiting = true;
+      exitReason = 'INTERRUPTED';
+  });
+
+  const finishTriToken = async () => {
+     if (finishTriToken.done) return;
+     finishTriToken.done = true;
+     
+     console.log('\n================ TRI-TOKEN SUMMARY ================');
+     console.log(`Wallet: ${publicKey.toBase58().slice(0, 4)}...${publicKey.toBase58().slice(-4)}`);
+     console.log(`Stats: planned=${TOTAL_TRADES} attempted=${stats.total} success=${stats.success} skipped=${stats.skipped} failed=${stats.failed}`);
+     
+     console.log('Trade Counts:');
+     for (const [pair, count] of Object.entries(tradeCounts)) {
+         console.log(`  ${pair}: ${count}`);
+     }
+     
+     console.log('Net Changes:');
+     for (const t of tokens) {
+         const net = netChanges[t.mint] || 0n;
+         const ui = bigintToUiString(net, t.decimals);
+         console.log(`  ${getSymbol(t.mint)}: ${ui}`);
+     }
+     
+     const elapsed = Date.now() - startTime;
+     console.log(`Elapsed: ${elapsed}ms`);
+     console.log('===================================================');
+  };
+
+  try {
+    for (let i = 1; i <= TOTAL_TRADES; i++) {
+        if (isExiting) break;
+        stats.total++;
+
+        // Schedule
+        const jitter = randomFloat(-JITTER_PCT, JITTER_PCT);
+        let delaySec = baseInterval * (1 + jitter);
+        delaySec = clamp(delaySec, MIN_DELAY, 120);
+
+        // Pick random pair
+        const idxA = Math.floor(Math.random() * tokens.length);
+        let idxB = Math.floor(Math.random() * tokens.length);
+        while (idxB === idxA) {
+            idxB = Math.floor(Math.random() * tokens.length);
+        }
+        const tokenA = tokens[idxA];
+        const tokenB = tokens[idxB];
+        const symA = getSymbol(tokenA.mint);
+        const symB = getSymbol(tokenB.mint);
+        const pairKey = `${symA}->${symB}`;
+
+        // Target Value
+        const targetUsdc = parseFloat(randomFloat(USDC_MIN, USDC_MAX).toFixed(2));
+
+        // Calculate Amount In
+        let priceA = await getJupPrice(tokenA.mint);
+        if (priceA === 0) {
+             // If price fails, we can't calculate amount safely based on USDC value.
+             // Try fallback if A is USDC
+             if (tokenA.mint === USDC_MINT) priceA = 1.0;
+             else {
+                 console.log(`[WARN] Could not get price for ${symA}, skipping`);
+                 stats.skipped++;
+                 await sleep(1000);
+                 continue;
+             }
+        }
+
+        const amountInUi = targetUsdc / priceA;
+        const amountIn = numberToTokenUnits(amountInUi, tokenA.decimals);
+
+        // Balance Check
+        let balA = await getTokenBalanceGeneric(connection, publicKey, tokenA.mint, tokenA.decimals);
+        let balB = await getTokenBalanceGeneric(connection, publicKey, tokenB.mint, tokenB.decimals);
+        
+        // 429 handling for balance check failure
+        // If balA is null, we assume we have enough? No, "Balance read failed... Using quote-based amounts for log only".
+        // But for *sending* the tx, we should ideally know we have funds.
+        // If we don't know balance, we might fail simulation.
+        // We will proceed and let simulation fail if insufficient.
+        
+        if (balA) {
+             let required = amountIn;
+             if (tokenA.mint === SOL_MINT) required += SOL_FEE_BUFFER;
+
+             if (balA.amount < required) {
+                  console.log(`[SKIP] Insufficient ${symA}. Have: ${bigintToUiString(balA.amount, tokenA.decimals)} Need: ${bigintToUiString(required, tokenA.decimals)}`);
+                  stats.skipped++;
+                  await sleep(1000);
+                  continue;
+             }
+        }
+
+        // Quote
+        let quote;
+        try {
+           quote = await jupiterQuote({
+               inputMint: tokenA.mint,
+               outputMint: tokenB.mint,
+               amount: amountIn,
+               slippageBps: 50,
+               swapMode: 'ExactIn'
+           });
+        } catch (err) {
+            console.log(`[TRI-TOKEN] Quote failed: ${err.message}`);
+            stats.failed++;
+            await sleep(FAIL_BACKOFF);
+            continue;
+        }
+
+        if (IS_DRY_RUN) {
+            console.log(`[TRI-TOKEN] Dry Run: ${symA}->${symB} ~${targetUsdc} USDC`);
+            stats.success++;
+        } else {
+            try {
+               // Swap
+               const swapRes = await jupiterSwap({
+                   quoteResponse: quote,
+                   userPublicKey: publicKey.toBase58()
+               });
+               const txBuf = Buffer.from(swapRes.swapTransaction, 'base64');
+               const tx = VersionedTransaction.deserialize(txBuf);
+               tx.sign([keypair]);
+
+               const sig = await connection.sendRawTransaction(tx.serialize(), { skipPreflight: true });
+               
+               // Silent confirm
+               await confirmByPolling(connection, sig, 60000, 2000, true);
+
+               // Post Balance
+               const postBalA = await getTokenBalanceGeneric(connection, publicKey, tokenA.mint, tokenA.decimals);
+               const postBalB = await getTokenBalanceGeneric(connection, publicKey, tokenB.mint, tokenB.decimals);
+
+               // Delta Calc
+               let deltaA, deltaB;
+               let isApprox = false;
+
+               if (balA && postBalA) {
+                   deltaA = postBalA.amount - balA.amount;
+               } else {
+                   deltaA = -BigInt(quote.inAmount); 
+                   isApprox = true;
+               }
+
+               if (balB && postBalB) {
+                   deltaB = postBalB.amount - balB.amount;
+               } else {
+                   deltaB = BigInt(quote.outAmount);
+                   isApprox = true;
+               }
+
+               // Valuation
+               let valStr = '';
+               // Try to be accurate
+               if (tokenA.mint === USDC_MINT) {
+                   const val = Math.abs(parseFloat(bigintToUiString(deltaA, 6)));
+                   valStr = `~${val.toFixed(2)} USDC`;
+               } else if (tokenB.mint === USDC_MINT) {
+                    const val = parseFloat(bigintToUiString(deltaB, 6));
+                    valStr = `~${val.toFixed(2)} USDC`;
+               } else {
+                    // Fallback to target
+                    valStr = `~${targetUsdc.toFixed(2)} USDC target`;
+               }
+
+               // Log
+               const dAStr = bigintToUiString(deltaA, tokenA.decimals);
+               const dBStr = bigintToUiString(deltaB, tokenB.decimals);
+               
+               if (isApprox) {
+                   console.log(`[WARN] Balance read failed (429). Using quote-based amounts for log only.`);
+               }
+
+               console.log(`[TRADE ${i}/${TOTAL_TRADES}] ${symA} -> ${symB} ${dAStr} ${symA} +${dBStr} ${symB} (${valStr})`);
+
+               stats.success++;
+               tradeCounts[pairKey] = (tradeCounts[pairKey] || 0) + 1;
+               netChanges[tokenA.mint] += deltaA;
+               netChanges[tokenB.mint] += deltaB;
+
+            } catch (err) {
+                console.log(`[TRI-TOKEN] Swap failed: ${err.message}`);
+                stats.failed++;
+            }
+        }
+
+        await sleep(delaySec * 1000);
+    }
+  } catch (err) {
+      exitReason = 'FAILED';
+      exitError = err.message;
+      throw err;
+  } finally {
+      await finishTriToken();
+  }
+}
+
+async function runAnchorRoundtripMode(connection, keypair, { walletLabel = null } = {}) {
+  // 1. Config
+  const TOTAL_CYCLES = parseInt(process.env.DRIP_TRADES || '10', 10); // Interpret as cycles
+  const WINDOW_SEC = parseInt(process.env.DRIP_WINDOW_SEC || '3600', 10);
+  const USDC_MIN = parseFloat(process.env.DRIP_AMOUNT_MIN_USDC || process.env.DRIP_USDC_MIN || '0.1');
+  const USDC_MAX = parseFloat(process.env.DRIP_AMOUNT_MAX_USDC || process.env.DRIP_USDC_MAX || '0.2');
+
+  // Validate Amount Config
+  if (isNaN(USDC_MIN) || USDC_MIN <= 0) {
+      throw new Error(`Invalid DRIP_AMOUNT_MIN_USDC: ${USDC_MIN}. Must be > 0.`);
+  }
+  if (isNaN(USDC_MAX) || USDC_MAX <= 0) {
+      throw new Error(`Invalid DRIP_AMOUNT_MAX_USDC: ${USDC_MAX}. Must be > 0.`);
+  }
+  if (USDC_MIN > USDC_MAX) {
+      throw new Error(`Invalid Amount Range: MIN (${USDC_MIN}) > MAX (${USDC_MAX})`);
+  }
+
+  const JITTER_PCT = parseFloat(process.env.DRIP_JITTER_PCT || '0.35');
+  const MIN_DELAY = parseInt(process.env.DRIP_MIN_DELAY_SEC || '5', 10);
+  const FAIL_BACKOFF = parseInt(process.env.DRIP_FAIL_BACKOFF_SEC || '20', 10) * 1000;
+  const IS_DRY_RUN = process.env.DRIP_DRY_RUN === 'true';
+  const ANCHOR_TG_NOTIFY = process.env.ANCHOR_TG_NOTIFY !== 'false';
+  const ANCHOR_TG_FORMAT = process.env.ANCHOR_TG_FORMAT || 'full'; // 'full' or 'compact'
+  const SOL_FEE_BUFFER = 5000000n; // 0.005 SOL buffer for fees
+
+  // --- Retry Config (Anchor) ---
+  const RETRY_MAX = parseInt(process.env.ANCHOR_SWAP_RETRY_MAX || '2', 10);
+  const RETRY_BACKOFF_MS = parseInt(process.env.ANCHOR_SWAP_RETRY_BACKOFF_MS || '500', 10);
+  const RETRY_BACKOFF_MAX_MS = parseInt(process.env.ANCHOR_SWAP_RETRY_BACKOFF_MAX_MS || '4000', 10);
+  const RETRY_SLIPPAGE_STEP = parseInt(process.env.ANCHOR_RETRY_SLIPPAGE_BPS_STEP || '25', 10);
+  const RETRY_SLIPPAGE_MAX = parseInt(process.env.ANCHOR_RETRY_SLIPPAGE_BPS_MAX || '200', 10);
+  const RETRY_SELL_ONLY = process.env.ANCHOR_RETRY_SELL_ONLY !== 'false'; // default true
+
+  // Helper: Execute Swap with Retry
+  async function executeSwapWithRetry({
+      inputMint,
+      outputMint,
+      amountIn,
+      baseSlippageBps,
+      legLabel,
+      isBuy
+  }) {
+      const maxAttempts = (isBuy && RETRY_SELL_ONLY) ? 1 : Math.max(1, RETRY_MAX);
+      let currentSlippage = baseSlippageBps;
+      let lastError = null;
+
+      for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+          try {
+              // 1. Quote
+              const quote = await jupiterQuote({
+                  inputMint,
+                  outputMint,
+                  amount: amountIn,
+                  slippageBps: currentSlippage,
+                  swapMode: 'ExactIn'
+              });
+
+              // 2. Dry Run Check
+              if (IS_DRY_RUN) {
+                  return { 
+                      inAmount: BigInt(quote.inAmount), 
+                      outAmount: BigInt(quote.outAmount),
+                      txId: 'dry-run-sig'
+                  };
+              }
+
+              // 3. Swap
+              const swapRes = await jupiterSwap({
+                  quoteResponse: quote,
+                  userPublicKey: publicKey.toBase58()
+              });
+              
+              const txBuf = Buffer.from(swapRes.swapTransaction, 'base64');
+              const tx = VersionedTransaction.deserialize(txBuf);
+              tx.sign([keypair]);
+              
+              const sig = await connection.sendRawTransaction(tx.serialize(), { skipPreflight: true });
+              await confirmByPolling(connection, sig, 60000, 2000, true);
+
+              // Success Log if it was a retry
+              if (attempt > 1) {
+                  console.log(`[RETRY] ${legLabel} succeeded on attempt=${attempt}`);
+              }
+              
+              return { 
+                  inAmount: BigInt(quote.inAmount), 
+                  outAmount: BigInt(quote.outAmount),
+                  txId: sig
+              };
+
+          } catch (err) {
+              lastError = err;
+              const isLast = attempt === maxAttempts;
+              
+              if (!isLast) {
+                  // Calculate Backoff (Exponential)
+                  let backoff = RETRY_BACKOFF_MS * Math.pow(2, attempt - 1); 
+                  if (backoff > RETRY_BACKOFF_MAX_MS) backoff = RETRY_BACKOFF_MAX_MS;
+                  
+                  // Adjust Slippage
+                  const oldSlippage = currentSlippage;
+                  if (currentSlippage < RETRY_SLIPPAGE_MAX) {
+                      currentSlippage += RETRY_SLIPPAGE_STEP;
+                      if (currentSlippage > RETRY_SLIPPAGE_MAX) currentSlippage = RETRY_SLIPPAGE_MAX;
+                  }
+
+                  console.log(`[RETRY] ${legLabel} attempt=${attempt}/${maxAttempts} backoff=${backoff}ms slippage=${oldSlippage}->${currentSlippage}bps reason=${err.message}`);
+                  
+                  await sleep(backoff);
+              }
+          }
+      }
+      throw lastError;
+  }
+
+  // Parse tokens & Filter USDC
+  let allTokens = [];
+  try {
+    allTokens = JSON.parse(process.env.DRIP_TOKENS_JSON || '[]');
+  } catch (e) {
+    throw new Error('Invalid DRIP_TOKENS_JSON format');
+  }
+  
+  // Candidates: Exclude USDC
+  const candidates = allTokens.filter(t => t.mint !== USDC_MINT);
+  if (candidates.length === 0) {
+      throw new Error('No non-USDC tokens found in DRIP_TOKENS_JSON for roundtrip');
+  }
+
+  const usdcConfig = allTokens.find(t => t.mint === USDC_MINT) || { decimals: 6 };
+
+  console.log(`[ANCHOR] Mode STARTED (USDC Anchor Roundtrip)`);
+  if (walletLabel) console.log(`[ANCHOR] Wallet Label: ${walletLabel}`);
+  console.log(`[ANCHOR] Config: ${TOTAL_CYCLES} cycles (2 tx each)`);
+  console.log(`[ANCHOR] Amount: ${USDC_MIN}-${USDC_MAX} USDC`);
+  console.log(`[ANCHOR] Pool: ${candidates.length} candidates`);
+  if (IS_DRY_RUN) console.log(`[ANCHOR] DRY RUN ENABLED`);
+
+  const baseInterval = WINDOW_SEC / TOTAL_CYCLES;
+  const publicKey = keypair.publicKey;
+
+  const stats = { success: 0, skipped: 0, failed: 0, total_cycles: 0 };
+  const roundtripCounts = {}; // mint -> count
+  candidates.forEach(t => roundtripCounts[t.mint] = 0);
+  
+  // Safe Balance Check Helper
+  const safeGetBalance = async (mint, decimals) => {
+      try {
+          const res = await getTokenBalanceGeneric(connection, publicKey, mint, decimals);
+          if (res) return res.amount;
+          return null;
+      } catch (err) {
+          return null;
+      }
+  };
+
+  // Initial Balances
+  let initialSol = null;
+  let initialUsdc = null;
+  if (!IS_DRY_RUN) {
+       initialSol = await safeGetBalance(SOL_MINT, 9);
+       initialUsdc = await safeGetBalance(USDC_MINT, 6);
+  }
+
+  const startTime = Date.now();
+  let isExiting = false;
+  let exitReason = 'SUCCESS';
+  let exitError = '';
+
+  process.once('SIGINT', async () => {
+      console.log('\n[ANCHOR] Caught interrupt signal (SIGINT). Stopping...');
+      isExiting = true;
+      exitReason = 'INTERRUPTED';
+  });
+
+  const finishAnchor = async () => {
+     if (finishAnchor.done) return;
+     finishAnchor.done = true;
+     
+     // 1. Final Balances
+     let finalSol = null;
+     let finalUsdc = null;
+     if (!IS_DRY_RUN) {
+         finalSol = await safeGetBalance(SOL_MINT, 9);
+         finalUsdc = await safeGetBalance(USDC_MINT, 6);
+     }
+
+     // 2. Prepare Data
+     const iSolStr = initialSol !== null ? bigintToUiString(initialSol, 9) : '?';
+     const iUsdcStr = initialUsdc !== null ? bigintToUiString(initialUsdc, 6) : '?';
+     const fSolStr = finalSol !== null ? bigintToUiString(finalSol, 9) : '?';
+     const fUsdcStr = finalUsdc !== null ? bigintToUiString(finalUsdc, 6) : '?';
+     
+     let netUsdcStr = '0.0000';
+     if (initialUsdc !== null && finalUsdc !== null) {
+         const diff = parseFloat(fUsdcStr) - parseFloat(iUsdcStr);
+         const sign = diff > 0 ? '+' : '';
+         netUsdcStr = `${sign}${diff.toFixed(4)}`;
+     }
+
+     const summary = {
+         walletLabel,
+         walletAddress: publicKey.toBase58(),
+         plannedCycles: TOTAL_CYCLES,
+         attemptedCycles: stats.total_cycles,
+         success: stats.success,
+         failed: stats.failed,
+         roundtripCounts: { ...roundtripCounts },
+         initialBalances: { sol: iSolStr, usdc: iUsdcStr },
+         finalBalances: { sol: fSolStr, usdc: fUsdcStr },
+         netUSDC: `${netUsdcStr} USDC`,
+         elapsedMs: Date.now() - startTime
+     };
+
+     // 3. Console Output
+     printAnchorSummaryConsole(summary);
+
+     // 4. Telegram Notification
+     if (TG_ENABLED && ANCHOR_TG_NOTIFY) {
+        try {
+            // Always use the card-style Telegram format
+            const msg = buildAnchorSummaryTelegram(summary);
+            
+            await sendTelegram(msg, {
+                botToken: TG_BOT_TOKEN,
+                chatId: TG_CHAT_ID,
+                enabled: true,
+                timeoutMs: TG_TIMEOUT_MS,
+                maxRetry: TG_MAX_RETRY
+            });
+        } catch (err) {
+            console.warn(`[WARN] Failed to send Anchor TG notification: ${err.message}`);
+        }
+     }
+  };
+
+  try {
+    const totalLegs = TOTAL_CYCLES * 2;
+    for (let i = 1; i <= TOTAL_CYCLES; i++) {
+        if (isExiting) break;
+        stats.total_cycles++;
+        const leg1No = (i - 1) * 2 + 1;
+        const leg2No = (i - 1) * 2 + 2;
+
+        // 1. Pick Token & Amount
+        const token = candidates[Math.floor(Math.random() * candidates.length)];
+        const targetUsdc = parseFloat(randomFloat(USDC_MIN, USDC_MAX).toFixed(2));
+        const amountUsdcIn = numberToTokenUnits(targetUsdc, 6); // USDC 6 decimals
+        
+        const sym = getSymbol(token.mint);
+        
+        // 2. BUY LEG: USDC -> Token
+        let buyResult;
+        try {
+             buyResult = await executeSwapWithRetry({
+                inputMint: USDC_MINT,
+                outputMint: token.mint,
+                amountIn: amountUsdcIn,
+                baseSlippageBps: 50,
+                legLabel: `LEG ${leg1No}/${totalLegs}`,
+                isBuy: true
+             });
+        } catch (err) {
+            console.log(`[ANCHOR] Buy Failed (Max Retries): ${err.message}`);
+            stats.failed++;
+            await sleep(FAIL_BACKOFF);
+            continue;
+        }
+
+        // Log Buy
+        if (IS_DRY_RUN) {
+             console.log(`[LEG ${leg1No}/${totalLegs}] USDC -> ${sym} (Dry Run)`);
+        } else {
+             const inUi = bigintToUiString(buyResult.inAmount, 6);
+             const outUi = bigintToUiString(buyResult.outAmount, token.decimals);
+             console.log(`[LEG ${leg1No}/${totalLegs}] USDC -> ${sym}   -${inUi} USDC   +${outUi} ${sym}`);
+        }
+
+        // 3. Determine Sell Amount
+        let amountTokenToSell = 0n;
+        
+        if (IS_DRY_RUN) {
+            amountTokenToSell = buyResult.outAmount;
+        } else {
+            const tokenBal = await safeGetBalance(token.mint, token.decimals);
+            if (tokenBal !== null) {
+                 amountTokenToSell = buyResult.outAmount; // Try to sell exact bought amount
+                 // But better to check actual balance if possible? 
+                 // Logic was: if balance check fails, use quote amount.
+                 // If balance check succeeds, use quote amount? 
+                 // Original logic: "if (tokenBal !== null) amountTokenToSell = BigInt(buyQuote.outAmount)"
+                 // So we prioritize the QUOTE output amount, assuming we received it.
+            } else {
+                 console.log(`[WARN] RPC rate limited (429). Using quote amount for Sell.`);
+                 amountTokenToSell = buyResult.outAmount;
+            }
+        }
+
+        // 4. SELL LEG: Token -> USDC
+        try {
+             const sellResult = await executeSwapWithRetry({
+                inputMint: token.mint,
+                outputMint: USDC_MINT,
+                amountIn: amountTokenToSell,
+                baseSlippageBps: 50,
+                legLabel: `LEG ${leg2No}/${totalLegs}`,
+                isBuy: false
+             });
+             
+             if (IS_DRY_RUN) {
+                 console.log(`[LEG ${leg2No}/${totalLegs}] ${sym} -> USDC (Dry Run)`);
+             } else {
+                 const inUi = bigintToUiString(sellResult.inAmount, token.decimals);
+                 const outUi = bigintToUiString(sellResult.outAmount, 6);
+                 console.log(`[LEG ${leg2No}/${totalLegs}] ${sym} -> USDC   -${inUi} ${sym}   +${outUi} USDC`);
+             }
+             
+             roundtripCounts[token.mint]++;
+             stats.success++;
+
+        } catch (err) {
+             console.log(`[ANCHOR] Sell Failed (Max Retries): ${err.message}`);
+             stats.failed++;
+        }
+        
+        // Interval
+        const jitter = randomFloat(-JITTER_PCT, JITTER_PCT);
+        let delaySec = baseInterval * (1 + jitter);
+        delaySec = clamp(delaySec, MIN_DELAY, 120);
+        await sleep(delaySec * 1000);
+    }
+  } catch (err) {
+      exitReason = 'FAILED';
+      exitError = err.message;
+      throw err;
+  } finally {
+      await finishAnchor();
+  }
+}
+
 async function runDripMode(connection, keypair, { walletLabel = null } = {}) {
+  if (process.env.DRIP_MODE === 'tri_token') {
+      return await runTriTokenMode(connection, keypair, { walletLabel });
+  }
+  if (process.env.DRIP_MODE === 'anchor_roundtrip') {
+      return await runAnchorRoundtripMode(connection, keypair, { walletLabel });
+  }
   // 1. Config
   const TOTAL_TRADES = parseInt(process.env.DRIP_TRADES || '150', 10);
   const WINDOW_SEC = parseInt(process.env.DRIP_WINDOW_SEC || '3600', 10);
@@ -1111,7 +1846,18 @@ async function runDripMode(connection, keypair, { walletLabel = null } = {}) {
 async function runMultiDrip(connection) {
   const wallets = [];
   
-  // 1. Load from Env (WALLET_1_MNEMONIC, WALLET_2_MNEMONIC, ...)
+  // 1. Load from WALLET_KEYS (comma separated)
+  if (process.env.WALLET_KEYS) {
+      const keys = process.env.WALLET_KEYS.split(',').map(k => k.trim()).filter(Boolean);
+      const labels = (process.env.WALLET_LABELS || '').split(',').map(l => l.trim());
+      
+      keys.forEach((mnemonic, idx) => {
+          const label = labels[idx] || `w${idx + 1}`;
+          wallets.push({ id: label, mnemonic });
+      });
+  }
+
+  // 2. Load from Env (WALLET_1_MNEMONIC, WALLET_2_MNEMONIC, ...) - Backward compatibility
   let i = 1;
   while (process.env[`WALLET_${i}_MNEMONIC`]) {
     wallets.push({
@@ -1121,7 +1867,7 @@ async function runMultiDrip(connection) {
     i++;
   }
 
-  // 2. Load from JSON (optional)
+  // 3. Load from JSON (optional)
   const jsonPath = 'wallets.json';
   if (fs.existsSync(jsonPath)) {
     try {
@@ -1142,27 +1888,38 @@ async function runMultiDrip(connection) {
   }
 
   if (wallets.length === 0) {
-    console.error('[MULTI] No wallets found. Set WALLET_1_MNEMONIC in .env or create wallets.json');
+    console.error('[MULTI] No wallets found. Set WALLET_KEYS in .env or create wallets.json');
     process.exit(1);
   }
 
   console.log(`[MULTI] Starting orchestrator for ${wallets.length} wallets...`);
   
-  // Launch in parallel with staggered start to reduce RPC spike
-  const promises = wallets.map(async (w, idx) => {
-    // Stagger start by 2 seconds per wallet
-    await sleep(idx * 2000);
+  // Sequential Execution
+  console.log('[MULTI] Mode: SEQUENTIAL (One by one to avoid RPC rate limits)');
+  
+  for (let idx = 0; idx < wallets.length; idx++) {
+    const w = wallets[idx];
+    console.log(`\n[MULTI] [${idx + 1}/${wallets.length}] Processing Wallet: ${w.id}`);
+    
     try {
       console.log(`[MULTI] Initializing wallet ${w.id}...`);
       assertMnemonic(w.mnemonic);
       const kp = deriveKeypairFromMnemonic(w.mnemonic);
-      await runDripMode(connection, kp, { walletLabel: w.id });
+      // await guarantees sequential execution
+      // Use Anchor Roundtrip mode
+      await runAnchorRoundtripMode(connection, kp, { walletLabel: w.id });
+      console.log(`[MULTI] Wallet ${w.id} COMPLETED.`);
     } catch (err) {
-      console.error(`[MULTI] Wallet ${w.id} failed to start: ${err.message}`);
+      console.error(`[MULTI] Wallet ${w.id} FAILED: ${err.message}`);
+      // Continue to next wallet
     }
-  });
+    
+    if (idx < wallets.length - 1) {
+       console.log(`[MULTI] Cooling down 2s before next wallet...`);
+       await sleep(2000);
+    }
+  }
 
-  await Promise.all(promises);
   console.log('[MULTI] All wallets finished.');
 }
 

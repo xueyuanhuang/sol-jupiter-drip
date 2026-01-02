@@ -6,6 +6,8 @@
   "main": "mvp-swap.js",
   "scripts": {
     "start": "node mvp-swap.js",
+    "start-ts": "ts-node src/index.ts",
+    "drip-multi": "ts-node src/index.ts drip",
     "swap:sol2usdc": "node mvp-swap.js SOL_TO_USDC",
     "swap:usdc2sol": "node mvp-swap.js USDC_TO_SOL"
   },
@@ -18,5 +20,11 @@
   },
   "engines": {
     "node": ">=20"
+  },
+  "devDependencies": {
+    "@types/fs-extra": "^11.0.4",
+    "@types/node": "^25.0.3",
+    "ts-node": "^10.9.2",
+    "typescript": "^5.9.3"
   }
 }
